@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Git, GitHub, Claude Code, Codex CLI, and Pi identity enforcement",
   "type": "module",
-  "private": true,
+  "files": ["bin", "scripts", "hooks", "skills", "extensions", ".claude-plugin", ".codex-plugin"],
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.ts && ./tests/test_git_identity_guard.sh",
     "typecheck": "tsc --noEmit"
