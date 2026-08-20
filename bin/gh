@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLUGIN_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
+CORE="$PLUGIN_ROOT/scripts/git-identity-guard"
+SELF="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)/gh"
+
+is_pr_create=0
+previous=''
+for arg in "$@"; do
+  if [[ "$previous" == "pr" && "$arg" == "create" ]]; then
+    is_pr_create=1
+    break
+  fi
+  previous="$arg"
+done
+
+IFS=: read -r -a path_entries <<<"${PATH:-}"
+real_gh=''
+for entry in "${path_entries[@]}"; do
+  [[ -n "$entry" ]] || entry='.'
+  candidate="$entry/gh"
+  if [[ -x "$candidate" ]]; then
+    candidate="$(CDPATH='' cd -- "$(dirname -- "$candidate")" && pwd -P)/gh"
+    if [[ "$candidate" != "$SELF" ]]; then
+      real_gh="$candidate"
+      break
+    fi
+  fi
+done
+[[ -n "$real_gh" ]] || {
+  printf 'git-identity-guard: không tìm thấy GitHub CLI thật trong PATH.\n' >&2
+  exit 127
+}
+
+if [[ "$is_pr_create" -eq 1 ]]; then
+  GIT_IDENTITY_GUARD_GH="$real_gh" "$CORE" verify-gh
+fi
+exec "$real_gh" "$@"

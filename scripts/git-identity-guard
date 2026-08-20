@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
+ZERO_SHA="0000000000000000000000000000000000000000"
+
+fail() {
+  printf 'git-identity-guard: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  git-identity-guard install --user <github-login> [--email <email>] [--name <name>]
+  git-identity-guard verify [--range <git-range>]
+  git-identity-guard verify-gh
+  git-identity-guard gh-pr-create [gh pr create options]
+  git-identity-guard hook <pre-commit|pre-push>
+  git-identity-guard uninstall
+EOF
+  exit 2
+}
+
+git_dir_path() {
+  local path
+  path="$(git rev-parse --git-dir 2>/dev/null)" || fail 'not inside a Git repository.'
+  if [[ "$path" != /* ]]; then
+    path="$(CDPATH='' cd -- "$path" && pwd -P)" || fail "could not resolve Git directory: $path"
+  fi
+  printf '%s\n' "$path"
+}
+
+git_hooks_path() {
+  local path
+  path="$(git rev-parse --git-path hooks 2>/dev/null)" || fail 'could not resolve Git hooks path.'
+  if [[ "$path" != /* ]]; then
+    path="$(CDPATH='' cd -- "$path" && pwd -P)" || fail "could not resolve hooks path: $path"
+  fi
+  printf '%s\n' "$path"
+}
+
+config_get() {
+  git config --local --get "$1" 2>/dev/null || true
+}
+
+lower() {
+  printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
+validate_user() {
+  local value="$1"
+  [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || fail '--user must be a valid GitHub login.'
+}
+
+validate_text() {
+  local value="$1"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || fail 'identity must not contain control whitespace.'
+}
+
+identity_parts() {
+  local ident="$1"
+  local name email
+  name="$(printf '%s\n' "$ident" | sed -E 's/ <[^>]*>.*$//')"
+  email="$(printf '%s\n' "$ident" | sed -nE 's/^.* <([^>]*)>.*$/\1/p')"
+  [[ -n "$email" ]] || fail "invalid Git identity: $ident"
+  printf '%s\t%s\n' "$name" "$email"
+}
+
+check_identity() {
+  local label="$1" actual_name="$2" actual_email="$3"
+  local expected_name expected_email
+  expected_name="$(config_get identity.guard.name)"
+  expected_email="$(config_get identity.guard.email)"
+  [[ -n "$expected_email" ]] || fail 'identity.guard.email is not configured; run install first.'
+  if [[ "$(lower "$actual_email")" != "$(lower "$expected_email")" ]]; then
+    fail "$label email mismatch: got '$actual_email', expected '$expected_email'."
+  fi
+  if [[ -n "$expected_name" && "$actual_name" != "$expected_name" ]]; then
+    fail "$label name mismatch: got '$actual_name', expected '$expected_name'."
+  fi
+}
+
+verify_current_identity() {
+  local author committer author_name author_email committer_name committer_email
+  author="$(git var GIT_AUTHOR_IDENT 2>/dev/null)" || fail 'could not read Git author identity.'
+  committer="$(git var GIT_COMMITTER_IDENT 2>/dev/null)" || fail 'could not read Git committer identity.'
+  IFS=$'\t' read -r author_name author_email <<<"$(identity_parts "$author")"
+  IFS=$'\t' read -r committer_name committer_email <<<"$(identity_parts "$committer")"
+  check_identity 'author' "$author_name" "$author_email"
+  check_identity 'committer' "$committer_name" "$committer_email"
+}
+
+check_commit_identity() {
+  local sha="$1" author_email="$2" author_name="$3" committer_email="$4" committer_name="$5"
+  check_identity "commit $sha author" "$author_name" "$author_email"
+  check_identity "commit $sha committer" "$committer_name" "$committer_email"
+}
+
+verify_commits() {
+  local sha line author_email author_name committer_email committer_name
+  while read -r sha; do
+    [[ -n "$sha" ]] || continue
+    line="$(git log -1 --format='%H%x09%ae%x09%an%x09%ce%x09%cn' "$sha")"
+    IFS=$'\t' read -r sha author_email author_name committer_email committer_name <<<"$line"
+    check_commit_identity "$sha" "$author_email" "$author_name" "$committer_email" "$committer_name"
+  done
+}
+
+verify_range() {
+  local range="$1"
+  git rev-list --max-count=1 "$range" >/dev/null 2>&1 || fail "invalid Git range: $range"
+  verify_commits < <(git rev-list "$range")
+}
+
+verify_unpushed_commits() {
+  local local_sha="$1" remote_name="$2"
+  verify_commits < <(git rev-list "$local_sha" --not --remotes="$remote_name")
+}
+
+find_gh() {
+  if [[ -n "${GIT_IDENTITY_GUARD_GH:-}" ]]; then
+    [[ -x "$GIT_IDENTITY_GUARD_GH" ]] || fail "gh binary is not executable: $GIT_IDENTITY_GUARD_GH"
+    printf '%s\n' "$GIT_IDENTITY_GUARD_GH"
+    return
+  fi
+  local plugin_gh
+  plugin_gh="$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd -P)/bin/gh"
+  local entry candidate
+  IFS=: read -r -a _path_entries <<<"${PATH:-}"
+  for entry in "${_path_entries[@]}"; do
+    [[ -n "$entry" ]] || entry='.'
+    candidate="$entry/gh"
+    if [[ -x "$candidate" ]]; then
+      candidate="$(CDPATH='' cd -- "$(dirname -- "$candidate")" && pwd -P)/gh"
+    fi
+    if [[ -x "$candidate" && "$candidate" != "$plugin_gh" ]]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  fail 'GitHub CLI (gh) was not found.'
+}
+
+verify_gh_user() {
+  local expected actual gh
+  expected="$(config_get identity.guard.user)"
+  [[ -n "$expected" ]] || fail 'identity.guard.user is not configured; run install first.'
+  gh="$(find_gh)"
+  actual="$("$gh" api user --jq '.login' 2>/dev/null)" || fail 'GitHub CLI authentication failed; run gh auth status.'
+  [[ -n "$actual" ]] || fail 'GitHub CLI did not return the current user.'
+  if [[ "$(lower "$actual")" != "$(lower "$expected")" ]]; then
+    fail "GitHub user mismatch: logged in as '$actual', expected '$expected'."
+  fi
+}
+
+verify_all() {
+  local check_gh=0 range=''
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --gh) check_gh=1; shift ;;
+      --range) [[ $# -ge 2 ]] || usage; range="$2"; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  verify_current_identity
+  if [[ -n "$range" ]]; then
+    verify_range "$range"
+  fi
+  if [[ "$check_gh" -eq 1 ]]; then
+    verify_gh_user
+  fi
+  return 0
+}
+
+write_hook() {
+  local hook_path="$1" hook_name="$2" original tmp
+  original="${hook_path}.identity-guard-original"
+  if [[ -L "$hook_path" ]]; then
+    fail "$hook_path is a symlink; refusing to replace the existing hook automatically."
+  fi
+  if [[ -e "$hook_path" ]] && ! grep -q '^# git-identity-guard managed hook$' "$hook_path"; then
+    [[ -e "$original" ]] || cp -p "$hook_path" "$original"
+  fi
+  tmp="${hook_path}.identity-guard.tmp.$$"
+  cat >"$tmp" <<EOF
+#!/bin/sh
+# git-identity-guard managed hook
+set -u
+runner="\$(git config --local --get identity.guard.runner 2>/dev/null || true)"
+if [ -z "\$runner" ] || [ ! -x "\$runner" ]; then
+  echo "git-identity-guard: runner is missing; run install again." >&2
+  exit 1
+fi
+original="\$0.identity-guard-original"
+if [ "$hook_name" = "pre-push" ]; then
+  tmp_input="\$(mktemp "\${TMPDIR:-/tmp}/git-identity-guard.XXXXXX")" || exit 1
+  trap 'rm -f "\$tmp_input"' EXIT HUP INT TERM
+  cat >"\$tmp_input" || exit 1
+  "\$runner" hook pre-push "\$@" <"\$tmp_input" || exit \$?
+  [ ! -x "\$original" ] || "\$original" "\$@" <"\$tmp_input"
+  exit \$?
+fi
+"\$runner" hook $hook_name "\$@" || exit \$?
+[ ! -x "\$original" ] || "\$original" "\$@"
+exit \$?
+EOF
+  chmod 755 "$tmp"
+  mv "$tmp" "$hook_path"
+}
+
+install_guard() {
+  local user='' email='' name='' current_email current_name git_dir runner runner_dir hooks_dir
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --user) [[ $# -ge 2 ]] || usage; user="$2"; shift 2 ;;
+      --email) [[ $# -ge 2 ]] || usage; email="$2"; shift 2 ;;
+      --name) [[ $# -ge 2 ]] || usage; name="$2"; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  [[ -n "$user" ]] || fail 'install requires --user <github-login>.'
+  validate_user "$user"
+  validate_text "$email"
+  validate_text "$name"
+  current_email="$(git config --get user.email 2>/dev/null || true)"
+  current_name="$(git config --get user.name 2>/dev/null || true)"
+  [[ -n "$email" ]] || email="$current_email"
+  [[ -n "$name" ]] || name="$current_name"
+  [[ -n "$email" ]] || fail 'provide --email or configure git user.email.'
+  [[ -n "$name" ]] || fail 'provide --name or configure git user.name.'
+  git_dir="$(git_dir_path)"
+  hooks_dir="$(git_hooks_path)"
+  runner_dir="$git_dir/identity-guard"
+  runner="$runner_dir/guard"
+  mkdir -p "$runner_dir" "$hooks_dir"
+  if [[ "$SCRIPT_DIR/$(basename -- "$0")" != "$runner" ]]; then
+    cp "$0" "$runner"
+  fi
+  chmod 755 "$runner"
+  git config --local identity.guard.user "$user"
+  git config --local identity.guard.email "$email"
+  git config --local identity.guard.name "$name"
+  git config --local identity.guard.runner "$runner"
+  write_hook "$hooks_dir/pre-commit" pre-commit
+  write_hook "$hooks_dir/pre-push" pre-push
+  printf '✓ Git Identity Guard installed for user %s (%s)\n' "$user" "$email"
+}
+
+uninstall_guard() {
+  local git_dir hooks_dir hook original runner
+  git_dir="$(git_dir_path)"
+  hooks_dir="$(git_hooks_path)"
+  for hook in pre-commit pre-push; do
+    if [[ -f "$hooks_dir/$hook" ]] && grep -q '^# git-identity-guard managed hook$' "$hooks_dir/$hook"; then
+      rm "$hooks_dir/$hook"
+      original="$hooks_dir/$hook.identity-guard-original"
+      [[ ! -e "$original" ]] || mv "$original" "$hooks_dir/$hook"
+    fi
+  done
+  runner="$(config_get identity.guard.runner)"
+  if [[ "$runner" == "$git_dir/identity-guard/"* ]]; then
+    rm -f "$runner"
+    rmdir "$git_dir/identity-guard" 2>/dev/null || true
+  fi
+  for key in identity.guard.user identity.guard.email identity.guard.name identity.guard.runner; do
+    git config --local --unset-all "$key" 2>/dev/null || true
+  done
+  printf '✓ Git Identity Guard removed from the current repository.\n'
+}
+
+pre_push() {
+  local remote_name="$1" local_sha remote_sha range
+  verify_current_identity
+  while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [[ -n "$local_sha" ]] || continue
+    [[ "$local_sha" == "$ZERO_SHA" ]] && continue
+    if [[ "$remote_sha" == "$ZERO_SHA" ]]; then
+      verify_unpushed_commits "$local_sha" "$remote_name"
+    else
+      range="$remote_sha..$local_sha"
+      verify_range "$range"
+    fi
+  done
+}
+
+case "${1:-}" in
+  install) shift; install_guard "$@" ;;
+  verify) shift; verify_all "$@" ;;
+  verify-gh) shift; verify_all --gh "$@" ;;
+  gh-pr-create)
+    shift
+    verify_all --gh
+    gh="$(find_gh)"
+    exec "$gh" pr create "$@"
+    ;;
+  hook)
+    [[ $# -ge 2 ]] || usage
+    case "$2" in
+      pre-commit) verify_all ;;
+      pre-push) shift 2; pre_push "$@" ;;
+      *) usage ;;
+    esac
+    ;;
+  uninstall) shift; [[ $# -eq 0 ]] || usage; uninstall_guard ;;
+  find-gh) find_gh ;;
+  *) usage ;;
+esac
