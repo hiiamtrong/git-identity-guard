@@ -6,7 +6,7 @@ Git Identity Guard is a cross-platform plugin for Claude Code and Codex CLI. It 
 
 - Stores the expected GitHub login, Git email, and author name in local Git configuration.
 - Installs chained `pre-commit` and `pre-push` hooks without discarding existing hooks.
-- Checks commit author/committer identity before commits and the complete outgoing range before pushes.
+- Checks commit author/committer identity before commits, and before pushes checks every outgoing commit that no remote-tracking ref already contains. Commits merged in from another remote, such as an upstream fork parent, keep their original authors and pass.
 - Provides Claude Code and Codex CLI PreToolUse hooks for `git commit`, `git push`, and `gh pr create`.
 - Verifies the current GitHub CLI account before pull request creation.
 

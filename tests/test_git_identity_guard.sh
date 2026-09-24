@@ -81,6 +81,28 @@ git -C "$repo" fetch -q origin
 git -C "$repo" switch -q -c feature-after-legacy
 git -C "$repo" push -q origin HEAD:refs/heads/feature-after-legacy
 
+# Commits already on another remote (a merged upstream) are not re-checked; local-only ones still are.
+upstream="$tmp_root/upstream.git"
+git init --bare -q "$upstream"
+git -C "$repo" remote add upstream "$upstream"
+git -C "$repo" switch -q -c upstream-work
+git -C "$repo" -c user.name='Upstream Author' -c user.email='upstream@example.com' \
+  commit --allow-empty --no-verify -q -m 'upstream commit'
+git -C "$repo" push --no-verify -q upstream HEAD:refs/heads/main
+git -C "$repo" switch -q feature-after-legacy
+git -C "$repo" branch -q -D upstream-work
+git -C "$repo" fetch -q upstream
+git -C "$repo" merge --no-ff -q upstream/main -m 'merge upstream'
+git -C "$repo" push -q origin HEAD:refs/heads/feature-after-legacy
+git -C "$repo" -c user.name='Other User' -c user.email='other@example.com' \
+  commit --allow-empty --no-verify -q -m 'local foreign commit'
+foreign_push_output="$(assert_fails git -C "$repo" push -q origin HEAD:refs/heads/feature-after-legacy)"
+assert_contains 'email mismatch' "$foreign_push_output"
+git -C "$repo" reset -q --hard HEAD~1
+unknown_sha='1111111111111111111111111111111111111111'
+unknown_output="$(cd "$repo" && assert_fails sh -c "printf 'refs/heads/x %s refs/heads/x %s\\n' \"\$(git rev-parse HEAD)\" $unknown_sha | .git/hooks/pre-push origin test")"
+[[ -n "$unknown_output" ]] || fail 'pre-push không fail-closed với remote sha lạ'
+
 git -C "$repo" config user.email 'wrong@example.com'
 printf 'two\n' >"$repo/two.txt"
 git -C "$repo" add two.txt
