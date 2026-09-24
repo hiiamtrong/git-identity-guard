@@ -1,6 +1,6 @@
 {
   "name": "git-identity-guard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Git, GitHub, Claude Code, Codex CLI, and Pi identity enforcement",
   "type": "module",
   "files": ["bin", "scripts", "hooks", "skills", "extensions", ".claude-plugin", ".codex-plugin"],

@@ -1,6 +1,6 @@
 {
   "name": "git-identity-guard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Blocks commits, pushes, and pull request creation when the Git or GitHub identity does not match the configured user.",
   "author": {
     "name": "hiiamtrong"
